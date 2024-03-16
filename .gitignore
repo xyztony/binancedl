@@ -1,0 +1,5 @@
+.DS_STORE
+nimcache/
+*.exe
+*.json
+.vscode/
