@@ -7,6 +7,7 @@ import zippy/ziparchives
 let 
   curl = newCurly()
 const
+  TMP_FILE = "crawl_tmp.xml"
   BUCKET_URL = "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision"
   BUCKET_WEBSITE_URL = "https://data.binance.vision"
 
@@ -170,13 +171,13 @@ proc isValidDay(d1, d2: DateTime): bool =
   else:
     return false
 
-proc retrieveLinks(tmpFile: string, initial: var bool, c: var BinanceBulkDownloader) = 
+proc retrieveLinks(initial: var bool, c: var BinanceBulkDownloader) = 
   var
     x: XmlParser
     nextMarker: string
     links = c.downloadList
   let 
-    filename = tmpFile
+    filename = TMP_FILE
     p = c.prefix
     lastSeen = c.lastSeen
 
@@ -253,7 +254,7 @@ proc retrieveLinks(tmpFile: string, initial: var bool, c: var BinanceBulkDownloa
       var tmp = newFileStream(filename, fmWrite)
       tmp.writeLine(r.body)
       tmp.close()
-      retrieveLinks(tmpFile, initial, c)
+      retrieveLinks(initial, c)
 
 proc batchDownload(c: var BinanceBulkDownloader, d: DownloadConfig) = 
   var
@@ -303,11 +304,10 @@ proc processFiles(list: seq[string], dir: string, m: MasterHandle) =
       m.spawn unzipp(kind, path, list, dir)
 
 proc crawl*(c: var BinanceBulkDownloader, d: DownloadConfig) = 
-  let tmpFile = "crawl_tmp.xml"
   var 
     initial = true
     m = createMaster()
-  retrieveLinks(tmpFile, initial, c)
+  retrieveLinks(initial, c)
   batchDownload(c, d)
   m.awaitAll:
     m.spawn processFiles(c.downloadList, d.destinationDirectory, getHandle m)
