@@ -6,13 +6,7 @@ from std/cmdline import commandLineParams
 proc main() = 
   let 
     args: seq[string] = commandLineParams()
-    p = Prefix(asset: Futures,
-      coin: COIN,
-      timeFrame: Daily,
-      marketDataKind: Trades,
-      token: "BTCUSD_PERP")
   var 
-    links: seq[string] = newSeq[string]()
     c = BinanceBulkDownloader.new
     d: DownloadConfig
     par = newParser: 
@@ -22,18 +16,12 @@ proc main() =
   try:
     var opts = par.parse(args)
     d = loadDownloadConfig(opts.config)
-    let dest = d.destinationDirectory
-    c.lastSeen = d.lastSeen
     c.skipChecksum = opts.skipchecksum
-    c.downloadList = links
-    c.destinationDirectory = dest
-    c.prefix = p
+    c.downloadList = newSeq[string]()
     crawl(c, d)
-    
-    d.lastSeen = c.lastSeen
-    saveDownloadConfig(d, opts.config)
+    saveDownloadConfig(d)
   except:
-    echo getCurrentExceptionMsg()
+    echo repr(getCurrentException()) & " message: " & getCurrentExceptionMsg()
   
 when isMainModule:
   main()

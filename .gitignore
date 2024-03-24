@@ -1,5 +1,11 @@
 .DS_STORE
-nimcache/
 *.exe
 *.json
+*.csv
+nimcache/
+notes.md
 .vscode/
+data/
+src/binancedlpkg/submodule
+src/binancedl
+binancedl

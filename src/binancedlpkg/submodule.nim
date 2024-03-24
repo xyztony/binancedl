@@ -2,7 +2,10 @@ import json, options, os, parsexml, streams, strformat, strutils, times
 import argparse
 import curly
 import malebolgia
+import malebolgia/ticketlocks
 import zippy/ziparchives
+
+from sequtils import mapIt
 
 let 
   curl = newCurly()
@@ -12,7 +15,8 @@ const
   BUCKET_WEBSITE_URL = "https://data.binance.vision"
 
 type
-  MissingConfigError = object of Exception
+  MissingConfigError = object of IOError
+  ParseJsonError = object of IOError
 
   AssetKind* = enum
     Futures = "futures",
@@ -39,115 +43,139 @@ type
     PremiumIndexKlines = "premiumIndexKlines",
     Trades = "trades"
 
+  TradeFile = object
+    ticker, extension: string
+    kind: MarketDataKind
+    date: DateTime
+
   Prefix* = object
+    dir*: string
     asset*: AssetKind
     coin*: CoinKind
     timeFrame*: TimeFrame
     marketDataKind*: MarketDataKind
     token*: string
+    extension*: string # not mandatory
+    date*: DateTime # not mandatory
 
   Asset* = object 
     daily*, monthly*: seq[string]
 
   Assets* = seq[Asset]
 
-  TradeFile = object
-    ticker, extension: string
-    kind: MarketDataKind
-    date: DateTime
-
   BinanceBulkDownloader* = ref object
     # Contains information relevant to downloading and managing future downloads
-    destinationDirectory*: string
     prefix*: Prefix
-    lastSeen*: TradeFile
     skipChecksum*: bool
     downloadList*: seq[string]
     downloadedList*: seq[string]
   
   DownloadConfig* = object
-    destinationDirectory*: string
-    lastSeen*: TradeFile
+    filename*: string
     batchSize*: int
+    prefixes*: seq[Prefix]
 
 # TODO
 proc validatePrefix(prefix: Prefix): bool = true
 
 proc `$`(p: Prefix): string = 
   assert p.validatePrefix, "The prefix must be valid"
-  result = fmt"data/{p.asset}/{p.coin}/{p.timeFrame}/{p.marketDataKind}/{p.token}/"
+  result = fmt"data/{p.asset}/{p.coin}/{p.timeFrame}/{p.marketDataKind}/{p.token}"
+
+proc toJson(p: Prefix): JsonNode = 
+  var date: DateTime
+  if $p.date == "Uninitialized DateTime":
+    date = now()
+  else:
+    date = p.date 
+  %*{
+    "directory": p.dir,
+    "asset": p.asset,
+    "coin": p.coin,
+    "timeFrame": p.timeFrame,
+    "marketDataKind": p.marketDataKind,
+    "token": p.token,
+    "extension": p.extension,
+    "date": date.format("yyyy-MM-dd")
+  }
+
+proc fromJson(p: JsonNode): Prefix  {.raises: [ParseJsonError].} =
+  var didRaise = false
+  try:
+    result = Prefix(
+      dir: p["directory"].getStr(),
+      asset: parseEnum[AssetKind](p["asset"].getStr()),
+      coin: parseEnum[CoinKind](p["coin"].getStr()),
+      timeFrame: parseEnum[TimeFrame](p["timeFrame"].getStr()),
+      marketDataKind: parseEnum[MarketDataKind](p["marketDataKind"].getStr()),
+      token: p["token"].getStr(),
+      extension: p{"extension"}.getStr() # not mandatory
+    )
+    if p{"date"}.getStr() != "":
+      result.date = parse(p["date"].getStr(), "yyyy-MM-dd")
+    
+  except:
+    didRaise = true
+  if didRaise:
+    let msg = "Could not parse prefix, please verify all fields are correct: " & $p
+    raise newException(ParseJsonError, msg)
 
 proc `$`(t: TradeFile): string = 
   result = join([t.ticker, $t.kind, t.date.format("yyyy-MM-dd")], "-")
   result = result & t.extension
 
-proc saveDownloadConfig*(config: DownloadConfig, filename: string) =
-  let configJson = %*{
+proc saveDownloadConfig*(config: DownloadConfig) =
+  var configJson = %*{
+    "filename": config.filename,
     "batchSize": config.batchSize,
-    "destinationDirectory": config.destinationDirectory,
-    "lastSeen": {
-      "ticker": config.lastSeen.ticker,
-      "extension": config.lastSeen.extension,
-      "kind": $config.lastSeen.kind,
-      "date": $config.lastSeen.date.format("yyyy-MM-dd")
-    }
+    "prefixes": []
   }
-  writeFile(filename, pretty(configJson))
+  if config.prefixes.len > 0:
+    for p in config.prefixes:
+      configJson["prefixes"].add(p.toJson)
+  writeFile(config.filename, pretty(configJson))
 
 proc loadDownloadConfig*(filename: string): DownloadConfig =
   if filename.len <= 0:
     raise newException(MissingConfigError, "Please provide a configuration file to download.")
-
   try:
     let configJson = parseJson(readFile(filename))
     assert configJson.hasKey("batchSize"), fmt"Config error [{filename}]: batchSize is mandatory in your config file"
-    assert configJson.hasKey("destinationDirectory"), fmt"Config error [{filename}]: destinationDirectory is mandatory in your config file"
-
+    result.filename = filename
     result.batchSize = configJson["batchSize"].getInt()
-    result.destinationDirectory = configJson["destinationDirectory"].getStr()
-    if configJson.hasKey("lastSeen"):
-      let lastSeenJson = configJson["lastSeen"]
-      result.lastSeen = TradeFile(
-        ticker: lastSeenJson["ticker"].getStr(),
-        extension: lastSeenJson["extension"].getStr(),
-        kind: parseEnum[MarketDataKind](lastSeenJson["kind"].getStr()),
-        date: parse(lastSeenJson["date"].getStr(), "yyyy-MM-dd")
-      )
-    else:
-      result.lastSeen = TradeFile( # fill the TradeFile with defaults
-        ticker: "",
-        extension: "",
-        kind: AggTrades,
-        date: now()
-      )
+    if configJson.hasKey("prefixes"):
+      result.prefixes = configJson["prefixes"].getElems.mapIt(it.fromJson)
   except:
-    raise newException(IOError, fmt"Please ensure you have provided a config file (json) which exists! Could not find or open {filename}")
+    raise newException(IOError, fmt"Please ensure you have provided a valid config file (json) which exists! Could not correctly parse {filename}")
 
-proc isDirectoryEmpty(directory: string): bool =
-  for kind, path in walkDir(directory):
+proc getFilenamesInDir(dir: string): seq[string] =
+  result = newSeq[string]()
+  for kind, path in walkDir(dir):
+    if kind == pcFile and path.endsWith(".csv"):
+      result.add(path)
+
+proc isDirectoryEmpty(dir: string): bool =
+  for kind, path in walkDir(dir):
     if kind == pcFile or kind == pcDir:
       return false
   return true
 
 proc parseFile(filename, extension: string = ""): Option[TradeFile] = 
   let fileparts = filename.split("-")
+  # we expect a filename in the following format: [TOKEN]-[MARKET DATA KIND]-[YYYY]-[MM]-[DD]
   if fileparts.len == 5:
     let 
-      ticker = fileparts[^5]
-      kind = parseEnum[MarketDataKind](fileparts[^4])
-      year = parseInt(fileparts[^3])
-      month = parseInt(fileparts[^2])
-      day = parseInt(fileparts[^1])
+      ticker = fileparts[0]
+      kind = parseEnum[MarketDataKind](fileparts[1])
+      year = parseInt(fileparts[2])
+      month = parseInt(fileparts[3])
+      day = parseInt(fileparts[4])
       fileDate = dateTime(year, Month(month), MonthdayRange(day))
     return some(TradeFile(ticker: ticker, kind: kind, date: fileDate, extension: extension))
-
   return none(TradeFile)
 
 proc mostRecentDownload(dir, extension: string): TradeFile = 
-  var 
-    file: TradeFile
-    date = dateTime(1900, Month(1), MonthdayRange(1))
-    
+  var date = dateTime(1900, Month(1), MonthdayRange(1))
   for kind, path in walkDir(dir):
     if kind == pcFile and path.endsWith(extension):
       let parts = splitFile(path)
@@ -156,47 +184,44 @@ proc mostRecentDownload(dir, extension: string): TradeFile =
       if isSome(parsed):
         let unpacked: TradeFile = parsed.get
         if unpacked.date > date:
-          file = unpacked
+          result = unpacked
           date = unpacked.date
-
-  return file
 
 proc isValidDay(d1, d2: DateTime): bool =
   let
     dt1 = dateTime(d1.year, d1.month, d1.monthday)
     dt2 = dateTime(d2.year, d2.month, d2.monthday)
+  return dt1 < dt2 and abs(dt1 - dt2) > initDuration(days = 1)
 
-  if dt1 < dt2 and abs(dt1 - dt2) > initDuration(days = 1):
-    return true
-  else:
-    return false
+proc markerFromPrefix(p: Prefix): string = 
+  result = join(@[p.token, $p.marketDataKind, p.date.format("yyyy-MM-dd")], "-")
+  result = $p & "/" & result & p.extension
 
-proc retrieveLinks(initial: var bool, c: var BinanceBulkDownloader) = 
+proc retrieveLinks(initial: bool, c: ptr BinanceBulkDownloader, L: ptr TicketLock) = 
   var
     x: XmlParser
     nextMarker: string
-    links = c.downloadList
+    links = c[].downloadList
+    downloadedLinks = c[].downloadedList
+
   let 
     filename = TMP_FILE
-    p = c.prefix
-    lastSeen = c.lastSeen
+    p = c[].prefix
 
   if initial:
     if fileExists(filename):
       removeFile(fileName)
 
     var url: string
-    if not isNil(addr lastSeen):
-      url = fmt"{BUCKET_URL}?delimeter=/&prefix={$p}&marker={$p}{$lastSeen}" 
+    if $p.date != "Uninitialized DateTime":
+      url = fmt"{BUCKET_URL}?delimeter=/&prefix={$p}&marker={p.markerFromPrefix}" 
     else:
       url = fmt"{BUCKET_URL}?delimeter=/&prefix={$p}" 
 
     let r = curl.get(url)
-
     var tmp = newFileStream(filename, fmWrite)
     tmp.writeLine(r.body)
     tmp.close()
-    initial = false
 
   var s = openFileStream(filename, fmRead)
   assert s != nil, fmt"There is an error opening {filename}"
@@ -214,12 +239,10 @@ proc retrieveLinks(initial: var bool, c: var BinanceBulkDownloader) =
               if x.elementName == "Key":
                 x.next
                 let key = x.charData
-                if key.endsWith(".zip"):
-                  links.add(x.charData)
-                  nextMarker = key
-                elif key.endsWith(".CHECKSUM"):
-                  if not c.skipChecksum:
+                if key.endsWith(".zip") or (key.endsWith(".CHECKSUM") and not c[].skipChecksum):
+                  if not downloadedLinks.contains(x.charData):
                     links.add(x.charData)
+                    nextMarker = key
                 break
             else:
               x.next
@@ -234,80 +257,67 @@ proc retrieveLinks(initial: var bool, c: var BinanceBulkDownloader) =
 
   x.close()
   s.close()
-  c.downloadList = links
+
+  withLock L[]:
+    c[].downloadList = links
 
   if nextMarker.len > 0:
-    let filename = split(splitPath(nextMarker).tail, ".")[0]
-    let tradeFile = filename.parseFile
+    let s = split(splitPath(nextMarker).tail, ".")
+    let tradeFileName = s[0]
+    let tradeFile = tradeFileName.parseFile
     if isSome(tradeFile):
-      let tf = tradeFile.get
-      if not isValidDay(tf.date, now()):
+      if not isValidDay(tradeFile.get.date, now()):
+        withLock L[]:
+          c[].prefix.date = tradeFile.get.date
+          c[].prefix.extension = s[1]
         removeFile(filename)
         return
-
     let url = fmt"{BUCKET_URL}?delimeter=/&prefix={$p}&marker={nextMarker}/"
     let r = curl.get(url)   
     if r.body.len <= 0:
       removeFile(filename)
-      return
     else:
       var tmp = newFileStream(filename, fmWrite)
       tmp.writeLine(r.body)
       tmp.close()
-      retrieveLinks(initial, c)
+      retrieveLinks(false, c, L)
 
-proc batchDownload(c: var BinanceBulkDownloader, d: DownloadConfig) = 
-  var
-    links = c.downloadList
-  let 
-    batchSize = min(d.batchSize, links.len - 1)
-    dir = d.destinationDirectory
+proc retrieveLinks(c: ptr BinanceBulkDownloader, L: ptr TicketLock) =  
+  retrieveLinks(true, c, L)
 
+proc batchDownload(links: seq[string], dir: string) = 
   if links.len > 0:
     if not dirExists(dir):
       createDir(dir)
 
-    for i in countup(0, links.len, batchSize):
-      let 
-        batchEnd = min(i + batchSize - 1, links.len - 1)
-        sbatch = links[i..batchEnd]
+    var batch: RequestBatch
+    for l in links:
+      batch.get(fmt"{BUCKET_WEBSITE_URL}/{l}")
 
-      var batch: RequestBatch
-      for l in sbatch:
-        batch.get(fmt"{BUCKET_WEBSITE_URL}/{l}")
-
-      for (response, error) in curl.makeRequests(batch):
-        if error == "":
-          let 
-            filename = response.url.split("/")[^1]
-            filePath = dir / filename
-          writeFile(filePath, response.body)
-
-
-proc unzipp(kind: PathComponent, path: string, dl: seq[string], dir: string) = 
-  let 
-    filename = splitPath(path).tail
-    isDownloaded = any(dl, proc(f: string): bool = filename in splitPath(f).tail)
-  if kind == pcFile and path.endswith(".zip") and isDownloaded:
-    let 
-      reader = openZipArchive(path)
-      csv = filename.split(".")[0] & ".csv"
-    try:
-      writeFile(dir/csv, reader.extractFile(csv))
-      removeFile(path)
-    except:
-      raise newException(IOError, fmt"There was an error reading/writing {csv} from its associated zip archive.")
-
-proc processFiles(list: seq[string], dir: string, m: MasterHandle) = 
-  if list.len > 0:
-    for kind, path in walkDir(dir):
-      m.spawn unzipp(kind, path, list, dir)
+    for (response, error) in curl.makeRequests(batch):
+      if error == "":
+        let 
+          filename = response.url.split("/")[^1]
+          filePath = dir / filename
+        writeFile(filePath, response.body)
+        let 
+          reader = openZipArchive(filePath)
+          csv = filename.split(".")[0] & ".csv"
+        try:
+          writeFile(dir/csv, reader.extractFile(csv))
+          removeFile(filePath)
+        except:
+          raise newException(IOError, fmt"There was an error reading/writing {csv} from its associated zip archive.")
 
 proc crawl*(c: var BinanceBulkDownloader, d: DownloadConfig) = 
-  var 
-    initial = true
-    m = createMaster()
-  retrieveLinks(initial, c)
-  batchDownload(c, d)
-  m.awaitAll:
-    m.spawn processFiles(c.downloadList, d.destinationDirectory, getHandle m)
+  var m = createMaster()
+  for p in d.prefixes:
+    var tmp = c
+    tmp.downloadList = @[]
+    tmp.downloadedList = getFilenamesInDir(p.dir)
+    m.awaitAll:
+      var 
+        L = initTicketLock()
+      tmp.prefix = p
+      m.spawn retrieveLinks(addr tmp, addr L)
+    batchDownload(tmp.downloadList, p.dir)
