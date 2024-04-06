@@ -15,13 +15,13 @@ proc main() =
  
   try:
     var opts = par.parse(args)
-    d = loadDownloadConfig(opts.config)
+    c.configPath = opts.config
+    d = loadDownloadConfig(c.configPath)
     c.skipChecksum = opts.skipchecksum
     c.downloadList = newSeq[string]()
     crawl(c, d)
-    saveDownloadConfig(d)
   except:
-    echo repr(getCurrentException()) & " message: " & getCurrentExceptionMsg()
+    echo repr(getCurrentException()) & " message:" & getCurrentExceptionMsg()
   
 when isMainModule:
   main()

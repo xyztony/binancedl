@@ -1,10 +1,9 @@
-import json, options, os, parsexml, streams, strformat, strutils, times
+import json, options, os, parsexml, streams, strformat, strutils, tables, times
 import argparse
 import curly
 import malebolgia
-import malebolgia/ticketlocks
 import zippy/ziparchives
-
+import std/algorithm
 from sequtils import mapIt
 
 let 
@@ -65,10 +64,13 @@ type
 
   BinanceBulkDownloader* = ref object
     # Contains information relevant to downloading and managing future downloads
+    configPath*: string
     prefix*: Prefix
     skipChecksum*: bool
     downloadList*: seq[string]
     downloadedList*: seq[string]
+    prefixMap: Table[string, Prefix]
+    downloadMap: Table[string, seq[string]]
   
   DownloadConfig* = object
     filename*: string
@@ -124,16 +126,19 @@ proc `$`(t: TradeFile): string =
   result = join([t.ticker, $t.kind, t.date.format("yyyy-MM-dd")], "-")
   result = result & t.extension
 
-proc saveDownloadConfig*(config: DownloadConfig) =
+
+proc cmpByDate(p1, p2: TradeFile): int = 
+  cmp(p1.date, p2.date)
+
+proc saveDownloadConfig*(path: string, config: DownloadConfig) =
   var configJson = %*{
-    "filename": config.filename,
     "batchSize": config.batchSize,
     "prefixes": []
   }
   if config.prefixes.len > 0:
     for p in config.prefixes:
       configJson["prefixes"].add(p.toJson)
-  writeFile(config.filename, pretty(configJson))
+  writeFile(path, pretty(configJson))
 
 proc loadDownloadConfig*(filename: string): DownloadConfig =
   if filename.len <= 0:
@@ -141,7 +146,6 @@ proc loadDownloadConfig*(filename: string): DownloadConfig =
   try:
     let configJson = parseJson(readFile(filename))
     assert configJson.hasKey("batchSize"), fmt"Config error [{filename}]: batchSize is mandatory in your config file"
-    result.filename = filename
     result.batchSize = configJson["batchSize"].getInt()
     if configJson.hasKey("prefixes"):
       result.prefixes = configJson["prefixes"].getElems.mapIt(it.fromJson)
@@ -160,7 +164,7 @@ proc isDirectoryEmpty(dir: string): bool =
       return false
   return true
 
-proc parseFile(filename, extension: string = ""): Option[TradeFile] = 
+proc parseFile(filename: string, extension: string = ""): Option[TradeFile] = 
   let fileparts = filename.split("-")
   # we expect a filename in the following format: [TOKEN]-[MARKET DATA KIND]-[YYYY]-[MM]-[DD]
   if fileparts.len == 5:
@@ -173,6 +177,18 @@ proc parseFile(filename, extension: string = ""): Option[TradeFile] =
       fileDate = dateTime(year, Month(month), MonthdayRange(day))
     return some(TradeFile(ticker: ticker, kind: kind, date: fileDate, extension: extension))
   return none(TradeFile)
+
+proc parseDownload(filename: string): TradeFile = 
+  let s = filename.split(".")
+  assert s.len == 2
+  let
+    fn = s[0]
+    ext = s[1]
+  let tf = parseFile(fn, "." & ext)
+  if isSome(tf):
+    return tf.get
+  else:
+    raise newException(IOError, "HELLO")
 
 proc mostRecentDownload(dir, extension: string): TradeFile = 
   var date = dateTime(1900, Month(1), MonthdayRange(1))
@@ -197,16 +213,16 @@ proc markerFromPrefix(p: Prefix): string =
   result = join(@[p.token, $p.marketDataKind, p.date.format("yyyy-MM-dd")], "-")
   result = $p & "/" & result & p.extension
 
-proc retrieveLinks(initial: bool, c: ptr BinanceBulkDownloader, L: ptr TicketLock) = 
+proc retrieveLinks(initial: bool, c: var BinanceBulkDownloader) = 
   var
     x: XmlParser
     nextMarker: string
-    links = c[].downloadList
-    downloadedLinks = c[].downloadedList
+    links = c.downloadList
+    downloadedLinks = c.downloadedList
 
   let 
     filename = TMP_FILE
-    p = c[].prefix
+    p = c.prefix
 
   if initial:
     if fileExists(filename):
@@ -239,7 +255,7 @@ proc retrieveLinks(initial: bool, c: ptr BinanceBulkDownloader, L: ptr TicketLoc
               if x.elementName == "Key":
                 x.next
                 let key = x.charData
-                if key.endsWith(".zip") or (key.endsWith(".CHECKSUM") and not c[].skipChecksum):
+                if key.endsWith(".zip") or (key.endsWith(".CHECKSUM") and not c.skipChecksum):
                   if not downloadedLinks.contains(x.charData):
                     links.add(x.charData)
                     nextMarker = key
@@ -258,8 +274,7 @@ proc retrieveLinks(initial: bool, c: ptr BinanceBulkDownloader, L: ptr TicketLoc
   x.close()
   s.close()
 
-  withLock L[]:
-    c[].downloadList = links
+  c.downloadList = links
 
   if nextMarker.len > 0:
     let s = split(splitPath(nextMarker).tail, ".")
@@ -267,9 +282,9 @@ proc retrieveLinks(initial: bool, c: ptr BinanceBulkDownloader, L: ptr TicketLoc
     let tradeFile = tradeFileName.parseFile
     if isSome(tradeFile):
       if not isValidDay(tradeFile.get.date, now()):
-        withLock L[]:
-          c[].prefix.date = tradeFile.get.date
-          c[].prefix.extension = s[1]
+        # withLock L[]:
+        c.prefix.date = tradeFile.get.date
+        c.prefix.extension = s[1]
         removeFile(filename)
         return
     let url = fmt"{BUCKET_URL}?delimeter=/&prefix={$p}&marker={nextMarker}/"
@@ -280,10 +295,10 @@ proc retrieveLinks(initial: bool, c: ptr BinanceBulkDownloader, L: ptr TicketLoc
       var tmp = newFileStream(filename, fmWrite)
       tmp.writeLine(r.body)
       tmp.close()
-      retrieveLinks(false, c, L)
+      retrieveLinks(false, c)
 
-proc retrieveLinks(c: ptr BinanceBulkDownloader, L: ptr TicketLock) =  
-  retrieveLinks(true, c, L)
+proc retrieveLinks(c: var BinanceBulkDownloader) =  
+  retrieveLinks(true, c)
 
 proc batchDownload(links: seq[string], dir: string) = 
   if links.len > 0:
@@ -309,15 +324,35 @@ proc batchDownload(links: seq[string], dir: string) =
         except:
           raise newException(IOError, fmt"There was an error reading/writing {csv} from its associated zip archive.")
 
-proc crawl*(c: var BinanceBulkDownloader, d: DownloadConfig) = 
-  var m = createMaster()
+proc getLastDownloadedFileDate(ps: seq[string]): DateTime = 
+  if ps.len > 0:
+    let tfs = ps.mapIt(it.parseDownload)
+    let sps = sorted(tfs, cmpByDate, Descending)
+    return sps[0].date
+
+proc crawl*(c: var BinanceBulkDownloader, d: var DownloadConfig) = 
+  var 
+    m = createMaster()
+    updatedPrefixes = newSeq[Prefix]()
+
   for p in d.prefixes:
-    var tmp = c
-    tmp.downloadList = @[]
-    tmp.downloadedList = getFilenamesInDir(p.dir)
-    m.awaitAll:
-      var 
-        L = initTicketLock()
-      tmp.prefix = p
-      m.spawn retrieveLinks(addr tmp, addr L)
-    batchDownload(tmp.downloadList, p.dir)
+    c.downloadList = @[]
+    c.downloadedList = getFilenamesInDir(p.dir)
+    c.prefix = p
+    retrieveLinks(c)
+    c.prefixMap[$p] = p
+    c.downloadMap[$p] = c.downloadList
+
+  m.awaitAll:
+    for ps, links in c.downloadMap:
+      let p = c.prefixMap[ps]
+      m.spawn batchDownload(links, p.dir)
+
+  for ps, links in c.downloadMap:
+    let lastDownloaded = getLastDownloadedFileDate(links)
+    var p = c.prefixMap[ps]
+    p.date = lastDownloaded
+    updatedPrefixes.add(p)
+
+  d.prefixes = updatedPrefixes
+  c.configPath.saveDownloadConfig(d)
