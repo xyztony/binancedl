@@ -30,7 +30,25 @@ type
     Daily = "daily",
     Monthly = "monthly"
 
+  Granularity* = enum
+    NONE = "none",
+    G1min = "1m",
+    G3min = "3m",
+    G5min = "5m",
+    G15min = "15m",
+    G30min = "30m",
+    G1hour = "1h",
+    G2hour = "2h",
+    G4hour = "4h",
+    G6hour = "6h",
+    G8hour = "8h",
+    G12hour = "12h",
+    G1day = "1d",
+    G3day = "3d",
+    G1week = "1w"
+
   MarketDataKind* = enum
+    UNKNOWN = "unknown",
     AggTrades = "aggTrades",
     BookDepth = "bookDepth",
     BookTicker = "bookTicker",
@@ -44,6 +62,7 @@ type
 
   TradeFile = object
     ticker, extension: string
+    granularity: Granularity
     kind: MarketDataKind
     date: DateTime
 
@@ -53,6 +72,7 @@ type
     coin*: CoinKind
     timeFrame*: TimeFrame
     marketDataKind*: MarketDataKind
+    granularity*: Granularity
     token*: string
     extension*: string # not mandatory
     date*: DateTime # not mandatory
@@ -83,6 +103,8 @@ proc validatePrefix(prefix: Prefix): bool = true
 proc `$`(p: Prefix): string = 
   assert p.validatePrefix, "The prefix must be valid"
   result = fmt"data/{p.asset}/{p.coin}/{p.timeFrame}/{p.marketDataKind}/{p.token}"
+  if p.granularity != Granularity.NONE:
+    result = fmt"{result}/{p.granularity}"
 
 proc toJson(p: Prefix): JsonNode = 
   var date: DateTime
@@ -96,6 +118,7 @@ proc toJson(p: Prefix): JsonNode =
     "coin": p.coin,
     "timeFrame": p.timeFrame,
     "marketDataKind": p.marketDataKind,
+    "granularity": p.granularity,
     "token": p.token,
     "extension": p.extension,
     "date": date.format("yyyy-MM-dd")
@@ -115,17 +138,15 @@ proc fromJson(p: JsonNode): Prefix  {.raises: [ParseJsonError].} =
     )
     if p{"date"}.getStr() != "":
       result.date = parse(p["date"].getStr(), "yyyy-MM-dd")
-    
+    if p{"granularity"}.getStr() != "":
+      result.granularity = parseEnum[Granularity](p{"granularity"}.getStr())
+    else:
+      result.granularity = Granularity.NONE
   except:
     didRaise = true
   if didRaise:
     let msg = "Could not parse prefix, please verify all fields are correct: " & $p
     raise newException(ParseJsonError, msg)
-
-proc `$`(t: TradeFile): string = 
-  result = join([t.ticker, $t.kind, t.date.format("yyyy-MM-dd")], "-")
-  result = result & t.extension
-
 
 proc cmpByDate(p1, p2: TradeFile): int = 
   cmp(p1.date, p2.date)
@@ -170,12 +191,21 @@ proc parseFile(filename: string, extension: string = ""): Option[TradeFile] =
   if fileparts.len == 5:
     let 
       ticker = fileparts[0]
-      kind = parseEnum[MarketDataKind](fileparts[1])
       year = parseInt(fileparts[2])
       month = parseInt(fileparts[3])
       day = parseInt(fileparts[4])
       fileDate = dateTime(year, Month(month), MonthdayRange(day))
-    return some(TradeFile(ticker: ticker, kind: kind, date: fileDate, extension: extension))
+    var
+      kind: MarketDataKind = MarketDataKind.UNKNOWN
+      granularity: Granularity = Granularity.NONE
+    try:
+      kind = parseEnum[MarketDataKind](fileparts[1])
+    except:
+      granularity = parseEnum[Granularity](fileparts[1])
+    if kind != MarketDataKind.UNKNOWN:
+      return some(TradeFile(ticker: ticker, kind: kind, date: fileDate, extension: extension))
+    elif granularity != Granularity.NONE:
+      return some(TradeFile(ticker: ticker, granularity: granularity, date: fileDate, extension: extension)) 
   return none(TradeFile)
 
 proc parseDownload(filename: string): TradeFile = 
@@ -210,7 +240,10 @@ proc isValidDay(d1, d2: DateTime): bool =
   return dt1 < dt2 and abs(dt1 - dt2) > initDuration(days = 1)
 
 proc markerFromPrefix(p: Prefix): string = 
-  result = join(@[p.token, $p.marketDataKind, p.date.format("yyyy-MM-dd")], "-")
+  var markerValues = @[p.token, $p.marketDataKind, p.date.format("yyyy-MM-dd")]
+  if p.granularity != Granularity.NONE:
+    markerValues[1] = $p.granularity
+  result = join(markerValues, "-")
   result = $p & "/" & result & p.extension
 
 proc retrieveLinks(initial: bool, c: var BinanceBulkDownloader) = 
@@ -275,14 +308,12 @@ proc retrieveLinks(initial: bool, c: var BinanceBulkDownloader) =
   s.close()
 
   c.downloadList = links
-
   if nextMarker.len > 0:
     let s = split(splitPath(nextMarker).tail, ".")
     let tradeFileName = s[0]
     let tradeFile = tradeFileName.parseFile
     if isSome(tradeFile):
       if not isValidDay(tradeFile.get.date, now()):
-        # withLock L[]:
         c.prefix.date = tradeFile.get.date
         c.prefix.extension = s[1]
         removeFile(filename)

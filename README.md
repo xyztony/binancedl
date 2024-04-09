@@ -18,16 +18,30 @@ To use, run the following command:
 The configuration file (`$YOUR_CONFIG.json`) is specified as follows:
 ```json
 {
-  "batchSize": 100, # batch size for download (if you include CHECKSUMS you will 
-                    # effectively download 50 .zip's and 50 .zip.CHECKSUM's)
-  "destinationDirectory": "data", # output/destination directory
-  "lastSeen": { # you do not need to modify this. This is just a *marker* 
-                # for where to pick up downloads in the future
-    "ticker": "BTCUSD_PERP",
-    "extension": ".zip",
-    "kind": "trades",
-    "date": "2024-01-01"
-  }
+  "batchSize": 10,
+  "prefixes": [
+    {
+      "directory": "data/btc/kline",
+      "asset": "futures",
+      "coin": "cm",
+      "timeFrame": "daily",
+      "marketDataKind": "klines",
+      "granularity": "15m",
+      "token": "BTCUSD_PERP",
+      "extension": ".zip",
+      "date": "2024-01-01"
+    },
+    {
+      "directory": "data/btc/candles",
+      "asset": "futures",
+      "coin": "cm",
+      "timeFrame": "daily",
+      "marketDataKind": "bookTicker",
+      "token": "BTCUSD_PERP",
+      "extension": ".zip",
+      "date": "2024-01-01"
+    }
+  ]
 }
 ```
 
