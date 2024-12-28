@@ -214,11 +214,11 @@ proc parseDownload(filename: string): TradeFile =
   let
     fn = s[0]
     ext = s[1]
-  let tf = parseFile(fn, "." & ext)
+    tf = parseFile(fn, "." & ext)
   if isSome(tf):
     return tf.get
   else:
-    raise newException(IOError, "HELLO")
+    raise newException(IOError, "Unable to parse data file")
 
 proc mostRecentDownload(dir, extension: string): TradeFile = 
   var date = dateTime(1900, Month(1), MonthdayRange(1))
@@ -338,6 +338,7 @@ proc batchDownload(links: seq[string], dir: string) =
 
     var batch: RequestBatch
     for l in links:
+      # echo "Req: " & repr(l)
       batch.get(fmt"{BUCKET_WEBSITE_URL}/{l}")
 
     for (response, error) in curl.makeRequests(batch):
@@ -349,11 +350,14 @@ proc batchDownload(links: seq[string], dir: string) =
         let 
           reader = openZipArchive(filePath)
           csv = filename.split(".")[0] & ".csv"
+        # echo filepath & " saved"
         try:
           writeFile(dir/csv, reader.extractFile(csv))
           removeFile(filePath)
         except:
           raise newException(IOError, fmt"There was an error reading/writing {csv} from its associated zip archive.")
+      # else:
+      #   echo "unable to download " & repr(error)
 
 proc getLastDownloadedFileDate(ps: seq[string]): DateTime = 
   if ps.len > 0:
@@ -377,7 +381,11 @@ proc crawl*(c: var BinanceBulkDownloader, d: var DownloadConfig) =
   m.awaitAll:
     for ps, links in c.downloadMap:
       let p = c.prefixMap[ps]
-      m.spawn batchDownload(links, p.dir)
+      
+      for i in countup(0, links.len - 1, d.batchSize):
+        let endIdx = min(i + d.batchSize - 1, links.len - 1)
+        let batchedLinks = links[i..endIdx]
+        m.spawn batchDownload(batchedLinks, p.dir)
 
   for ps, links in c.downloadMap:
     let lastDownloaded = getLastDownloadedFileDate(links)

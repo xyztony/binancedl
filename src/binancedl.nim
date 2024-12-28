@@ -3,16 +3,16 @@ import argparse
 
 from std/cmdline import commandLineParams
 
-proc main() = 
-  let 
+proc main() =
+  let
     args: seq[string] = commandLineParams()
-  var 
+  var
     c = BinanceBulkDownloader.new
     d: DownloadConfig
-    par = newParser: 
+    par = newParser:
       flag("-s", "--skipchecksum")
       option("-c", "--config", help="Path for config file")
- 
+      
   try:
     var opts = par.parse(args)
     c.configPath = opts.config
@@ -22,6 +22,6 @@ proc main() =
     crawl(c, d)
   except:
     echo repr(getCurrentException()) & " message:" & getCurrentExceptionMsg()
-  
+
 when isMainModule:
   main()
